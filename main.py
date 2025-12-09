@@ -1,12 +1,13 @@
 import os
 import torch
-import random
 import argparse
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from transformers import DataCollatorForLanguageModeling
+# Defined modules
 from LoadData import load_medical_dataset, INFERENCE_PROMPT_STYLE
 from LoadModel import getModel, getLoRAModel
 from runQwen import runSample
+from utils import same_seed
 
 parser = argparse.ArgumentParser(description="LLM Inference.")
 parser.add_argument("--cuda", type=str, default="0")
@@ -16,8 +17,7 @@ parser.add_argument("--arch", type=str, default="baseline")
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
-random.seed(42)
-torch.manual_seed(42)
+same_seed(42)
 
 ### Model Config
 models_dir = "/mnt/zhangchen/models/"
