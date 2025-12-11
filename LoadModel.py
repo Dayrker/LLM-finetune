@@ -4,7 +4,10 @@ from peft import LoraConfig, get_peft_model
 
 # Model Config
 def getModel(model_dir, cuda_maps, dtype=torch.bfloat16):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_dir, 
+        padding_side='left',
+        use_fast=True)
     model_ori = AutoModelForCausalLM.from_pretrained(
         model_dir,
         device_map=cuda_maps,  
