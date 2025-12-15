@@ -19,26 +19,24 @@ def convert_linear_to_te(linear: nn.Linear):
     )
 
     # 复制权重
-    # print("\nlinear.weight.data:", linear.weight.data.device)
     te_linear.weight.data.copy_(linear.weight.data)
-    # print("te_linear.weight.data:", te_linear.weight.data.device)
     if linear.bias is not None:
         te_linear.bias.data.copy_(linear.bias.data)
 
     return nn.ModuleDict({"default": te_linear, })
 
-def convert_linear_to_dw(linear: nn.Linear, mode="baseline"):
-    dwLinear = dw.modules.FcLayer(linear, mode)
+def convert_linear_to_dw(linear: nn.Linear, precision="baseline"):
+    dwLinear = dw.modules.FcLayer(linear, precision)
     return nn.ModuleDict({"default": dwLinear, })
 
-def replace_lora_modules(model, arch="te"):
+def replace_lora_modules(model, arch="te", precision="baseline"):
     for name, module in model.named_children():
         # 递归替换
-        replace_lora_modules(module, arch)
+        replace_lora_modules(module, arch, precision)
 
         # if isinstance(module, LoraLayer):
         if name in ["lora_A", "lora_B"]:
             if arch == "te":
                 setattr(model, name, convert_linear_to_te(module["default"].bfloat16()))
             elif arch == "dw":
-                setattr(model, name, convert_linear_to_dw(module["default"].bfloat16(), "MXFP8"))
+                setattr(model, name, convert_linear_to_dw(module["default"].bfloat16(), precision))

@@ -20,11 +20,11 @@ def getModel(model_dir, cuda_maps, dtype=torch.bfloat16):
 
 
 # LoRA config (微调LORA设置)
-def getLoRAModel(model_ori):
+def getLoRAModel(model_ori, lora_rank=64):
     peft_config = LoraConfig(
         lora_alpha=16,                           # Scaling factor for LoRA
         lora_dropout=0.05,                       # Add slight dropout for regularization
-        r=64,                                    # Rank of the LoRA update matrices
+        r=lora_rank,                                    # Rank of the LoRA update matrices
         bias="none",                             # No bias reparameterization
         task_type="CAUSAL_LM",                   # Task type: Causal Language Modeling
         target_modules=[

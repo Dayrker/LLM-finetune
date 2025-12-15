@@ -6,7 +6,7 @@ from transformers import DataCollatorForLanguageModeling
 # Defined modules
 from LoadData import load_medical_dataset, INFERENCE_PROMPT_STYLE
 from LoadModel import getModel, getLoRAModel
-from runQwen import runSample
+from LoadEval import runSample
 from utils import same_seed, replace_lora_modules
 # Finetune config
 from trl import SFTTrainer, SFTConfig
@@ -18,9 +18,12 @@ from contextlib import nullcontext
 
 parser = argparse.ArgumentParser(description="LLM Inference.")
 parser.add_argument("--cuda", type=str, default="0")
-parser.add_argument("--batch_size", type=int, default=32)
+parser.add_argument("--batch_size", type=int, default=8)
 parser.add_argument("--train_epochs", type=int, default=1)
+parser.add_argument("--lora_rank", type=int, default=64)
 parser.add_argument("--arch", type=str, default="baseline")
+parser.add_argument("--precision", type=str, default="bf16")
+parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B")
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
@@ -28,10 +31,14 @@ same_seed(42)
 
 ### Model Config
 models_dir = "/mnt/zhangchen/models/"
-model_ori, tokenizer = getModel(models_dir + "Qwen/Qwen3-8B", "cuda:0")
+model_ori, tokenizer = getModel(models_dir + args.model, "cuda:0")
+if "llama" in args.model.lower():   # Llama needs pad_token
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
 ### LORA model
-model_lora, peft_config = getLoRAModel(model_ori)
+model_lora, peft_config = getLoRAModel(model_ori, args.lora_rank)   # 此时model_ori也已经被修改
+# model_lora.gradient_checkpointing_enable()    # 重算激活值，减少60%显存占用，耗时增加10倍
 
 ### Load dataset
 train_dataset = load_medical_dataset(
@@ -54,7 +61,7 @@ inputs = tokenizer(
 # print(response[0].split("### Response:")[1])
 
 ### Fintune Initialize
-output_dir = f"checkpoint/{args.arch}/epochs_{args.train_epochs}"
+output_dir = f"checkpoint/{args.model}/{args.arch}/rank_{args.lora_rank}/{args.precision}/epochs_{args.train_epochs}"
 training_arguments = TrainingArguments( # Training Arguments
     output_dir=output_dir,
     per_device_train_batch_size=args.batch_size,  # 32B -> 8; 8B -> 32
@@ -64,6 +71,8 @@ training_arguments = TrainingArguments( # Training Arguments
     num_train_epochs=args.train_epochs,
     logging_steps=50,
     logging_strategy="steps",
+    save_strategy="epoch",
+    save_steps=1,
     warmup_steps=10,
     learning_rate=2e-4,
     fp16=False,
@@ -86,18 +95,22 @@ trainer = SFTTrainer(   # Initialize the Trainer
 )
 # convert te model
 if args.arch != "baseline":
-    replace_lora_modules(model_lora, arch=args.arch)
-print("TE LORA model:", model_lora)
+    replace_lora_modules(model_lora, arch=args.arch, precision=args.precision)
+print("LORA model:", model_lora)
 # metrics = trainer.evaluate()
 # print("first evaluate:", metrics)
 
 ### Model Training
-te_recipe = recipe.MXFP8BlockScaling(fp8_format=recipe.Format.E4M3)
+if args.precision == "mxfp8":
+    te_recipe = recipe.MXFP8BlockScaling(fp8_format=recipe.Format.HYBRID)
+elif args.precision == "nvfp4":
+    te_recipe = recipe.NVFP4BlockScaling(fp4_format=recipe.Format.E2M1)    # nvfp4 Only has E2M1
+
 with te.autocast(enabled=True, recipe=te_recipe) if args.arch == "te" else nullcontext():
     trainer.train()
 
-    ### Model Inference After Fine-Tuning
-    response = runSample(model=model_ori, tokenizer=tokenizer, device="cuda:0", inputs=inputs)
-    print("Inference after fintune:\n", response[0].split("### Response:")[1])
-    metrics = trainer.evaluate()
-    print("last evaluate:", metrics)
+    # ### Model Inference After Fine-Tuning
+    # response = runSample(model=model_ori, tokenizer=tokenizer, device="cuda:0", inputs=inputs)
+    # print("Inference after fintune:\n", response[0].split("### Response:")[1])
+    # metrics = trainer.evaluate()
+    # print("last evaluate:", metrics)
