@@ -8,6 +8,7 @@ from LoadModel import getModel
 # Metrics
 from sacrebleu import sentence_bleu
 from evaluate import load
+from transformers import AutoTokenizer
 # Parallel
 import torch.multiprocessing as mp
 
@@ -42,7 +43,8 @@ def extract_response(text):
     match = re.search(r"</think>(.*)", text, flags=re.S)
     return match.group(1).strip() if match else ""
 
-def compute_rougeL(pred, ref, rouge_metric):
+def compute_rougeL(pred, ref):
+    rouge_metric = load("/mnt/zhangchen/S3Precision/SoftLink/llm-fintune/evaluate/metrics/rouge/rouge.py")
     res = rouge_metric.compute(
         predictions=[pred],
         references=[ref],
@@ -54,9 +56,35 @@ def compute_rougeL(pred, ref, rouge_metric):
 def compute_bleu(pred, ref):
     return sentence_bleu(pred, [ref]).score
 
+def truncate(texts, tokenizer):
+    ids = tokenizer(
+        texts,
+        truncation=True,
+        max_length=512,
+        return_tensors=None,
+    )["input_ids"]
+    return tokenizer.batch_decode(ids, skip_special_tokens=True)
+
+def compute_bert_score(preds, refs):
+    bert_dir = "/mnt/zhangchen/models/BERT/xlm-roberta-large"
+    tokenizer = AutoTokenizer.from_pretrained(
+        bert_dir
+    )
+    preds = truncate(preds, tokenizer)
+    refs  = truncate(refs, tokenizer)
+
+    bertscore = load("/mnt/zhangchen/S3Precision/SoftLink/llm-fintune/evaluate/metrics/bertscore/bertscore.py")
+    results = bertscore.compute(
+        predictions=preds, 
+        references=refs, 
+        model_type=bert_dir,
+    )
+    
+    return results['precision']
+
 def evalMetrics(model_name="Qwen/Qwen3-8B", device="cuda:0", 
                model=None, tokenizer=None, peft_log=None,
-               dataset=None, metrics=["rougeL", "BLEU"], rouge_metric=None, return_queue=None, start_index=0):
+               dataset=None, metrics=["rougeL", "BLEU"], return_queue=None, start_index=0):
     ### Load Saved Perf Model
     if model == None:
         models_dir = "/mnt/zhangchen/models/"
@@ -65,6 +93,10 @@ def evalMetrics(model_name="Qwen/Qwen3-8B", device="cuda:0",
     if peft_log != None:
         model = PeftModel.from_pretrained(model, "checkpoint/" + peft_log)
     dataLen = len(dataset['Question'])
+    
+    if "llama" in model_name.lower():   # Llama needs pad_token
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     Results = []
     model.eval()
@@ -94,7 +126,7 @@ def evalMetrics(model_name="Qwen/Qwen3-8B", device="cuda:0",
                 record["preds_cot"] = preds_cot[j]
                 record["refs_cot"] = refs_cot[j]
                 record["rougeL"] = compute_rougeL(
-                    preds_cot[j], refs_cot[j], rouge_metric
+                    preds_cot[j], refs_cot[j]
                 )
             if "BLEU" in metrics:   # 动态启用 BLEU
                 record["preds_response"] = preds_response[j]
@@ -103,7 +135,16 @@ def evalMetrics(model_name="Qwen/Qwen3-8B", device="cuda:0",
                     preds_response[j], refs_response[j]
                 )
             Results.append(record)
-    
+
+        if "BERTScore" in metrics:   # 动态启用 BERTScore
+            BERTScores = compute_bert_score(preds_response, refs_response)
+            for j, record in enumerate(Results[i: i+batch]):
+                if "preds_response" not in record:
+                    record["preds_response"] = preds_response[j]
+                if "refs_response" not in record:
+                    record["refs_response"] = refs_response[j]
+                record["BERTScore"] = BERTScores[j]
+
     # 返回本 GPU 结果
     return_queue.put(Results)
 
@@ -111,7 +152,6 @@ def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B",
                 model=None, tokenizer=None, peft_log=None,
                 dataset=None, metrics=["rougeL", "BLEU"],
                 world_size=4,):
-    rouge_metric = None if "rougeL" not in metrics else load("rouge")
     # 给每条样本加 index，便于切分 dataset 为 world_size 份
     dataset = dataset.add_column("index", list(range(len(dataset))))
     ds_slices = []
@@ -132,7 +172,7 @@ def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B",
             target=evalMetrics,
             args=(model_name, f"cuda:{rank}",
                   model, tokenizer, peft_log,
-                  ds_slices[rank], metrics, rouge_metric, return_queue, rank * per_gpu)
+                  ds_slices[rank], metrics, return_queue, rank * per_gpu)
         )
         p.start()
         processes.append(p)
@@ -154,6 +194,10 @@ def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B",
     if "BLEU" in metrics:
         summary["mean_BLEU"] = round(
             sum(r["BLEU"] for r in all_results) / len(all_results), 4
+        )
+    if "BERTScore" in metrics:
+        summary["mean_BERTScore"] = round(
+            sum(r["BERTScore"] for r in all_results) / len(all_results), 4
         )
     all_results.append({"summary": summary})
 
@@ -213,8 +257,8 @@ if __name__ == "__main__":
     # evalMetrics(model=model_ori, tokenizer=tokenizer, device="cuda:0", 
     #             inputs=inputs, peft_log="baseline/epochs_1/checkpoint-730", 
     #             dataset=eval_dataset, metrics=["BLEU"])
-    evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B", 
-                        peft_log="te/epochs_1/checkpoint-730", 
-                        dataset=eval_dataset, metrics=["BLEU", "rougeL"], 
+    evalMetrics_multi_gpu(model_name="llama/Llama-3-8B-Instruct", 
+                        peft_log="llama/Llama-3-8B-Instruct/te/rank_32/nvfp4/epochs_1/checkpoint-730", 
+                        dataset=eval_dataset, metrics=["BLEU", "rougeL", "BERTScore"], 
                         world_size=len(args.cuda.split(",")),)
 
