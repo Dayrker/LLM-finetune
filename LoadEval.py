@@ -1,4 +1,5 @@
 import re
+import os
 import json
 import torch
 from tqdm import tqdm
@@ -11,16 +12,21 @@ from evaluate import load
 from transformers import AutoTokenizer
 # Parallel
 import torch.multiprocessing as mp
+# replace model
+from utils import same_seed, replace_lora_modules
+# transformer engine
+import transformer_engine.pytorch as te
+from transformer_engine.common import recipe
+from contextlib import nullcontext
 
-def runSample(model_name="Qwen/Qwen3-8B", device="cuda:0", inputs=None, model=None, tokenizer=None, peft_log=None):
+def runSample(model_path="/mnt/zhangchen/models/Qwen/Qwen3-8B", device="cuda:0", inputs=None, 
+            model=None, tokenizer=None, peft_log=None):
     ### Load Saved Perf Model
     if model == None:
-        models_dir = "/mnt/zhangchen/models/"
-        model, tokenizer = getModel(models_dir + model_name, device)
-    EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
+        model, tokenizer = getModel(model_path, device)
 
     if peft_log != None:
-        model = PeftModel.from_pretrained(model, "checkpoint/" + peft_log)
+        model = PeftModel.from_pretrained(model, peft_log)
     
     outputs = model.generate(
         input_ids=inputs.input_ids,
@@ -82,73 +88,96 @@ def compute_bert_score(preds, refs):
     
     return results['precision']
 
-def evalMetrics(model_name="Qwen/Qwen3-8B", device="cuda:0", 
+def evalMetrics(model_path="/mnt/zhangchen/models/Qwen/Qwen3-8B", device="cuda:0", 
                model=None, tokenizer=None, peft_log=None,
                dataset=None, metrics=["rougeL", "BLEU"], return_queue=None, start_index=0):
+    torch.cuda.set_device(device)   # 一个很坑的bug. 即使我在replace_lora_modules里面是分别指定GPU的，但在多GPU eval的时候，还是会报错LoRA跟input x 不在同一各设备上。只能出此下策
     ### Load Saved Perf Model
     if model == None:
-        models_dir = "/mnt/zhangchen/models/"
-        model, tokenizer = getModel(models_dir + model_name, device)
-    EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
-    if peft_log != None:
-        model = PeftModel.from_pretrained(model, "checkpoint/" + peft_log)
-    dataLen = len(dataset['Question'])
-    
-    if "llama" in model_name.lower():   # Llama needs pad_token
+        model, tokenizer = getModel(model_path, device)
+
+    content = nullcontext()
+    if peft_log != None:    # Get peft model & Replace
+        model = PeftModel.from_pretrained(model, peft_log)
+        
+        arch      = peft_log.split("/")[-5]
+        precision = peft_log.split("/")[-3]
+        if ("te" in peft_log) or ("dw" in peft_log):    # 为了速度，eval的时候都用TE
+            replace_lora_modules(model, arch="te", precision=precision)
+            # if "te" in peft_log:
+            if precision == "mxfp8":
+                te_recipe = recipe.MXFP8BlockScaling(fp8_format=recipe.Format.E4M3)
+                content = te.autocast(enabled=True, recipe=te_recipe)
+            elif precision == "nvfp4":
+                te_recipe = recipe.NVFP4BlockScaling(fp4_format=recipe.Format.E2M1)    # nvfp4 Only has E2M1
+                content = te.autocast(enabled=True, recipe=te_recipe)
+
+    if "llama" in model_path.lower():   # Llama needs pad_token
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     Results = []
     model.eval()
-    batch = 64
-    for i in tqdm(range(0, dataLen, batch)):
-        # Get Prediction
-        questions = dataset['Question'][i: i + batch]
-        inputs = tokenizer( # 'input_ids' 'attention_mask'
-            [INFERENCE_PROMPT_STYLE.format(que) for que in questions],
-            return_tensors="pt",
-            padding=True,           # 启用填充，使批次内长度一致
-        ).to(device)
-        responses = runSample(model=model, tokenizer=tokenizer, device=device, inputs=inputs)
-        preds_cot      = [extract_think(text)    for text in responses]
-        preds_response = [extract_response(text) for text in responses]
-        # Get Reference
-        refs_cot       = dataset['Complex_CoT'][i: i + batch]
-        refs_response  = dataset['Response'][i: i + batch]
+    batch = 64  # 记得为32的倍数
+    dataLen = len(dataset['Question'])
+    with content:   # For TE autocast
+        for i in tqdm(range(0, dataLen, batch)):
+            # Padding to 32 倍数
+            real_bs = min(batch, dataLen - i)
+            te_bs   = ((real_bs + 31) // 32) * 32
+            questions = dataset['Question'][i: i + real_bs]
+            if te_bs > real_bs:
+                questions += [""] * (te_bs - real_bs)
+            # Get Prediction
+            # questions = dataset['Question'][i: i + batch]
+            inputs = tokenizer( # 'input_ids' 'attention_mask'
+                [INFERENCE_PROMPT_STYLE.format(que) for que in questions],
+                return_tensors="pt",
+                padding=True,           # 启用填充，使批次内长度一致
+            ).to(device)
+            responses = runSample(model=model, tokenizer=tokenizer, device=device, inputs=inputs)
+            preds_cot      = [extract_think(text)    for text in responses]
+            preds_response = [extract_response(text) for text in responses]
+            # Get Reference
+            refs_cot       = dataset['Complex_CoT'][i: i + batch]
+            refs_response  = dataset['Response'][i: i + batch]
+            if te_bs > real_bs: # Padding to 32 倍数
+                refs_cot += [""] * (te_bs - real_bs)
+                refs_response += [""] * (te_bs - real_bs)
 
-        for j in range(len(responses)):
-            record = {
-                "index": start_index + i + j,
-                "predictions": responses[j],
-            }
+            for j in range(real_bs):
+                record = {
+                    "index": start_index + i + j,
+                    "predictions": responses[j],
+                }
 
-            if "rougeL" in metrics:  # 动态启用 Rouge
-                record["preds_cot"] = preds_cot[j]
-                record["refs_cot"] = refs_cot[j]
-                record["rougeL"] = compute_rougeL(
-                    preds_cot[j], refs_cot[j]
-                )
-            if "BLEU" in metrics:   # 动态启用 BLEU
-                record["preds_response"] = preds_response[j]
-                record["refs_response"] = refs_response[j]
-                record["BLEU"] = compute_bleu(
-                    preds_response[j], refs_response[j]
-                )
-            Results.append(record)
-
-        if "BERTScore" in metrics:   # 动态启用 BERTScore
-            BERTScores = compute_bert_score(preds_response, refs_response)
-            for j, record in enumerate(Results[i: i+batch]):
-                if "preds_response" not in record:
+                if "rougeL" in metrics:  # 动态启用 Rouge
+                    record["preds_cot"] = preds_cot[j]
+                    record["refs_cot"] = refs_cot[j]
+                    record["rougeL"] = compute_rougeL(
+                        preds_cot[j], refs_cot[j]
+                    )
+                if "BLEU" in metrics:   # 动态启用 BLEU
                     record["preds_response"] = preds_response[j]
-                if "refs_response" not in record:
                     record["refs_response"] = refs_response[j]
-                record["BERTScore"] = BERTScores[j]
+                    record["BLEU"] = compute_bleu(
+                        preds_response[j], refs_response[j]
+                    )
+                Results.append(record)
+
+            if "BERTScore" in metrics:   # 动态启用 BERTScore
+                BERTScores = compute_bert_score(preds_response, refs_response)
+                for j, record in enumerate(Results[i: i+real_bs]):
+                    if "preds_response" not in record:
+                        record["preds_response"] = preds_response[j]
+                    if "refs_response" not in record:
+                        record["refs_response"] = refs_response[j]
+                    record["BERTScore"] = BERTScores[j]
 
     # 返回本 GPU 结果
     return_queue.put(Results)
 
-def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B", 
+def evalMetrics_multi_gpu(model_path="/mnt/zhangchen/models/Qwen/Qwen3-8B", 
                 model=None, tokenizer=None, peft_log=None,
                 dataset=None, metrics=["rougeL", "BLEU"],
                 world_size=4,):
@@ -170,7 +199,7 @@ def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B",
     for rank in range(world_size):
         p = mp.Process(
             target=evalMetrics,
-            args=(model_name, f"cuda:{rank}",
+            args=(model_path, f"cuda:{rank}",
                   model, tokenizer, peft_log,
                   ds_slices[rank], metrics, return_queue, rank * per_gpu)
         )
@@ -203,7 +232,7 @@ def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B",
 
     # === 保存 JSON ===
     save_dir  = "" if peft_log is None else peft_log
-    save_file = "checkpoint/" + f"{save_dir}/EvalResults_multiGPU.json"
+    save_file = f"{save_dir}/EvalResults_multiGPU.json"
 
     with open(save_file, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
@@ -215,15 +244,15 @@ def evalMetrics_multi_gpu(model_name="Qwen/Qwen3-8B",
 
 if __name__ == "__main__":
     ### cuda
-    import argparse, os
+    import argparse
     parser = argparse.ArgumentParser(description="LLM Eval.")
     parser.add_argument("--cuda", type=str, default="0")
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+    same_seed(0)
 
     ### Model Config
-    models_dir = "/mnt/zhangchen/models/"
-    model_ori, tokenizer = getModel(models_dir + "Qwen/Qwen3-8B", "cuda:0")
+    model_ori, tokenizer = getModel("/mnt/zhangchen/models/Qwen/Qwen3-8B", "cuda:0")
     EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
     ### Load Dataset
     train_dataset = load_medical_dataset(
@@ -243,7 +272,7 @@ if __name__ == "__main__":
     ).to("cuda")
 
     ### Test 0
-    # response = runSample(model_name="Qwen/Qwen3-8B", device="cuda:0", inputs=inputs, peft_log="baseline/epochs_1/checkpoint-730")
+    # response = runSample(model_path="/mnt/zhangchen/models/Qwen/Qwen3-8B", device="cuda:0", inputs=inputs, peft_log="baseline/epochs_1/checkpoint-730")
     # print("Inference after finetune:\n", response[0])
 
     ### Test 1
@@ -257,8 +286,10 @@ if __name__ == "__main__":
     # evalMetrics(model=model_ori, tokenizer=tokenizer, device="cuda:0", 
     #             inputs=inputs, peft_log="baseline/epochs_1/checkpoint-730", 
     #             dataset=eval_dataset, metrics=["BLEU"])
-    evalMetrics_multi_gpu(model_name="llama/Llama-3-8B-Instruct", 
-                        peft_log="llama/Llama-3-8B-Instruct/te/rank_32/nvfp4/epochs_1/checkpoint-730", 
+    checkpoint_dir = "/mnt/zhangchen/S3Precision/LLM-finetune/checkpoint/"
+    evalMetrics_multi_gpu(model_path="/mnt/zhangchen/models/llama/Llama-3-8B-Instruct", 
+                        peft_log=checkpoint_dir + "llama/Llama-3-8B-Instruct/dw/rank_32/mxfp8/epochs_1/checkpoint-730", 
+                        # peft_log=None,
                         dataset=eval_dataset, metrics=["BLEU", "rougeL", "BERTScore"], 
                         world_size=len(args.cuda.split(",")),)
 

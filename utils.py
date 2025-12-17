@@ -16,7 +16,7 @@ def convert_linear_to_te(linear: nn.Linear):
         out_features=linear.out_features,
         bias=(linear.bias is not None),
         params_dtype=linear.weight.dtype,
-    )
+    ).to(linear.weight.device)
 
     # 复制权重
     te_linear.weight.data.copy_(linear.weight.data)
@@ -40,3 +40,5 @@ def replace_lora_modules(model, arch="te", precision="baseline"):
                 setattr(model, name, convert_linear_to_te(module["default"].bfloat16()))
             elif arch == "dw":
                 setattr(model, name, convert_linear_to_dw(module["default"].bfloat16(), precision))
+            else:
+                raise ValueError(f"Unsupported arch: {arch}.")
