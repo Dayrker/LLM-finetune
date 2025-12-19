@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser(description="LLM Inference.")
 parser.add_argument("--cuda", type=str, default="0")
 parser.add_argument("--batch_size", type=int, default=8)
 parser.add_argument("--train_epochs", type=int, default=1)
-parser.add_argument("--lora_rank", type=int, default=64)
+parser.add_argument("--lora_rank", type=int, default=32)
 parser.add_argument("--arch", type=str, default="baseline")
 parser.add_argument("--precision", type=str, default="bf16")
 parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B")
@@ -61,6 +61,7 @@ inputs = tokenizer(
 # print(response[0].split("### Response:")[1])
 
 ### Fintune Initialize
+# os.environ["NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING"] = "1"
 output_dir = f"checkpoint/{args.model}/{args.arch}/rank_{args.lora_rank}/{args.precision}/epochs_{args.train_epochs}"
 training_arguments = TrainingArguments( # Training Arguments
     output_dir=output_dir,
@@ -107,6 +108,7 @@ elif args.precision == "nvfp4":
     te_recipe = recipe.NVFP4BlockScaling(fp4_format=recipe.Format.E2M1)    # nvfp4 Only has E2M1
 
 with te.autocast(enabled=True, recipe=te_recipe) if args.arch == "te" else nullcontext():
+# with nullcontext():
     trainer.train()
 
     # ### Model Inference After Fine-Tuning
