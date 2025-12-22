@@ -1,4 +1,3 @@
-import dw
 import torch
 import random
 import torch.nn as nn
@@ -26,6 +25,7 @@ def convert_linear_to_te(linear: nn.Linear):
     return nn.ModuleDict({"default": te_linear, })
 
 def convert_linear_to_dw(linear: nn.Linear, precision="baseline"):
+    import dw   # 只有使用的时候才会import，解耦依赖
     dwLinear = dw.modules.FcLayer(linear, precision)
     return nn.ModuleDict({"default": dwLinear, })
 
