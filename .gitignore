@@ -3,3 +3,4 @@ checkpoint/llama/*
 checkpoint/Qwen/*
 checkpoint/pictures/*
 __pycache__/*
+debug/*
